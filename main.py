@@ -1,34 +1,36 @@
 import os
+import glob
 import asyncio
+import random
 import time
+import shutil
 import requests
 import sys
+import base64
 from datetime import datetime
-from fastapi import FastAPI
+from typing import Optional
+from fastapi import FastAPI, BackgroundTasks
+from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from playwright.async_api import async_playwright
 from motor.motor_asyncio import AsyncIOMotorClient
 
-# --- 🔥 ENV CONFIGURATION (HARDCODED FOR STABILITY) 🔥 ---
-# آپ نے جو ٹوکن اور آئی ڈیز دی ہیں، وہ یہاں سیٹ کر دی ہیں
+# --- 🔥 ENV CONFIGURATION 🔥 ---
 RAILWAY_TOKEN = "7a4ef37f-1830-4c06-a802-d1dff8922ee2"
 RAILWAY_SERVICE_ID = "f3ebcb8d-70db-41a8-81dc-d7c14e550cbe" 
 RAILWAY_ENV_ID = "f323efa2-e1bd-4c3e-9790-080ef9481b92"
 
-# MongoDB Config
 MONGO_URI = "mongodb://mongo:AEvrikOWlrmJCQrDTQgfGtqLlwhwLuAA@crossover.proxy.rlwy.net:29609"
 DB_NAME = "number_manager"
 COL_PENDING = "phone_numbers"
 COL_SUCCESS = "success_numbers"
 COL_FAILED = "failed_numbers"
-
-# Global URL
 BASE_URL = "https://id5.cloud.huawei.com"
 
-# --- APP SETUP ---
 app = FastAPI()
-
 CAPTURE_DIR = "./captures"
 if not os.path.exists(CAPTURE_DIR): os.makedirs(CAPTURE_DIR)
+app.mount("/captures", StaticFiles(directory=CAPTURE_DIR), name="captures")
 
 try:
     from captcha_solver import solve_captcha
@@ -56,7 +58,7 @@ async def get_next_number_from_db():
         log_msg(f"DB Error: {e}", "ERROR")
         return None
 
-async def move_number_to_collection(phone, status):
+async def move_number_to_collection(phone, status, error_image_b64=None):
     try:
         client = AsyncIOMotorClient(MONGO_URI)
         db = client[DB_NAME]
@@ -65,17 +67,33 @@ async def move_number_to_collection(phone, status):
         target_col = db[target_col_name]
         source_col = db[COL_PENDING]
         
-        await target_col.insert_one({
+        data = {
             "phone": phone,
             "status": status,
             "timestamp": datetime.now()
-        })
+        }
+        
+        # If failed and image provided, save it
+        if status == "failed" and error_image_b64:
+            data["error_screenshot"] = error_image_b64
+            
+            # --- 10 IMAGE LIMIT LOGIC ---
+            # Check count
+            count = await target_col.count_documents({})
+            if count >= 10:
+                # Find oldest and delete
+                oldest = await target_col.find().sort("timestamp", 1).limit(1).to_list(length=1)
+                if oldest:
+                    await target_col.delete_one({"_id": oldest[0]["_id"]})
+        
+        await target_col.insert_one(data)
         await source_col.delete_one({"phone": phone})
         log_msg(f"📦 Moved {phone} to {target_col_name}", "DB")
+        
     except Exception as e:
         log_msg(f"DB Move Error: {e}", "ERROR")
 
-# --- RAILWAY REDEPLOY (ACTUAL API CALL) ---
+# --- RAILWAY REDEPLOY ---
 def trigger_redeploy():
     log_msg("🔄 Sending Redeploy Signal to Railway API...", "SYSTEM")
     
@@ -85,7 +103,6 @@ def trigger_redeploy():
         "Content-Type": "application/json"
     }
     
-    # Correct GraphQL Mutation
     query = """
     mutation serviceInstanceRedeploy($serviceId: String!, $environmentId: String!) {
         serviceInstanceRedeploy(serviceId: $serviceId, environmentId: $environmentId)
@@ -99,15 +116,12 @@ def trigger_redeploy():
     
     try:
         response = requests.post(url, json={"query": query, "variables": variables}, headers=headers)
-        log_msg(f"API Response: {response.text}", "DEBUG")
-        
         if response.status_code == 200 and "errors" not in response.json():
-            log_msg("✅ Redeploy Triggered Successfully! Shutting down...", "SYSTEM")
-            time.sleep(2) # Give logs time to flush
+            log_msg("✅ Redeploy Triggered! Shutting down...", "SYSTEM")
+            time.sleep(2)
             os._exit(0)
         else:
             log_msg(f"❌ API Redeploy Failed: {response.text}", "ERROR")
-            # Fallback: Just crash, maybe auto-restart helps
             os._exit(1)
             
     except Exception as e:
@@ -173,9 +187,8 @@ async def smart_action(page, finder, verifier, step_name, wait_after=5):
 
 # --- MAIN WORKER ---
 async def master_loop():
-    log_msg("🟢 Auto-Bot Started (v3.0 API Redeploy Mode)", "INIT")
+    log_msg("🟢 Auto-Bot Started (v3.1 With Error Capture)", "INIT")
     
-    # 1. Fetch Number
     db_doc = await get_next_number_from_db()
     if not db_doc:
         log_msg("ℹ️ No 'pending' numbers found. Sleeping 5 mins...", "IDLE")
@@ -186,29 +199,27 @@ async def master_loop():
     current_number = db_doc['phone']
     log_msg(f"🔵 PROCESSING NUMBER: {current_number}", "START")
 
-    # 2. Run Session
     try:
         # Pass BASE_URL explicitly if needed, but it's global now
-        res = await run_session(current_number, SETTINGS["country"])
+        result, error_img = await run_session(current_number, SETTINGS["country"])
         
-        # 3. Move Number
-        if res == "success":
+        if result == "success":
             log_msg("🎉 SESSION SUCCESS! Moving to DB...", "RESULT")
             await move_number_to_collection(current_number, "success")
         else:
-            log_msg("❌ SESSION FAILED. Moving to DB...", "RESULT")
-            await move_number_to_collection(current_number, "failed")
+            log_msg("❌ SESSION FAILED. Moving to DB with Evidence...", "RESULT")
+            await move_number_to_collection(current_number, "failed", error_img)
             
     except Exception as e:
         log_msg(f"🔥 CRITICAL CRASH: {e}", "FATAL")
         await move_number_to_collection(current_number, "failed")
 
-    # 4. RESTART VIA API
     log_msg("🔄 Job Done. Calling Railway API...", "SYSTEM")
     await asyncio.sleep(2)
     trigger_redeploy()
 
 async def run_session(phone, country):
+    error_screenshot = None
     try:
         async with async_playwright() as p:
             launch_args = {
@@ -218,7 +229,7 @@ async def run_session(phone, country):
 
             log_msg("🚀 Launching Browser...", "INIT")
             try: browser = await p.chromium.launch(**launch_args)
-            except Exception as e: log_msg(f"❌ Launch Fail: {e}", "ERROR"); return "failed"
+            except Exception as e: log_msg(f"❌ Launch Fail: {e}", "ERROR"); return "failed", None
 
             pixel_5 = p.devices['Pixel 5'].copy()
             pixel_5['viewport'] = {'width': 412, 'height': 950}
@@ -235,7 +246,10 @@ async def run_session(phone, country):
                 await asyncio.sleep(5) 
             except Exception as e: 
                 log_msg(f"❌ Timeout/Load Error: {e}", "ERROR")
-                return "failed"
+                # Capture Error
+                img_bytes = await page.screenshot(type='jpeg', quality=50)
+                error_screenshot = base64.b64encode(img_bytes).decode('utf-8')
+                return "failed", error_screenshot
 
             # REGISTER
             if not await smart_action(
@@ -244,7 +258,9 @@ async def run_session(phone, country):
                 lambda: page.get_by_text("Stay informed", exact=False), 
                 "Register_Text",
                 wait_after=5
-            ): return "failed"
+            ): 
+                img_bytes = await page.screenshot(type='jpeg', quality=50)
+                return "failed", base64.b64encode(img_bytes).decode('utf-8')
 
             # AGREE
             cb = page.get_by_text("Stay informed", exact=False)
@@ -258,7 +274,9 @@ async def run_session(phone, country):
                 lambda: page.get_by_text("Date of birth", exact=False),
                 "Agree_Last",
                 wait_after=5
-            ): return "failed"
+            ): 
+                img_bytes = await page.screenshot(type='jpeg', quality=50)
+                return "failed", base64.b64encode(img_bytes).decode('utf-8')
 
             # DOB
             if not await smart_action(
@@ -267,7 +285,9 @@ async def run_session(phone, country):
                 lambda: page.get_by_text("Use phone number", exact=False),
                 "DOB_Next_Text",
                 wait_after=5
-            ): return "failed"
+            ): 
+                img_bytes = await page.screenshot(type='jpeg', quality=50)
+                return "failed", base64.b64encode(img_bytes).decode('utf-8')
 
             # PHONE TAB
             if not await smart_action(
@@ -276,7 +296,9 @@ async def run_session(phone, country):
                 lambda: page.get_by_text("Country/Region"), 
                 "UsePhone_Text",
                 wait_after=5
-            ): return "failed"
+            ): 
+                img_bytes = await page.screenshot(type='jpeg', quality=50)
+                return "failed", base64.b64encode(img_bytes).decode('utf-8')
 
             # COUNTRY
             log_msg(f"🌍 Selecting Country: {country}", "ACTION")
@@ -286,7 +308,9 @@ async def run_session(phone, country):
                 lambda: page.get_by_placeholder("Search", exact=False),
                 "Open_Country_List",
                 wait_after=3
-            ): return "failed"
+            ): 
+                img_bytes = await page.screenshot(type='jpeg', quality=50)
+                return "failed", base64.b64encode(img_bytes).decode('utf-8')
 
             search = page.get_by_placeholder("Search", exact=False).first
             await search.click()
@@ -299,7 +323,8 @@ async def run_session(phone, country):
                 await asyncio.sleep(3) 
             else:
                 log_msg("❌ Country Not Found in List", "ERROR")
-                await browser.close(); return "failed"
+                img_bytes = await page.screenshot(type='jpeg', quality=50)
+                await browser.close(); return "failed", base64.b64encode(img_bytes).decode('utf-8')
 
             # INPUT PHONE
             inp = page.locator("input[type='tel']").first
@@ -315,7 +340,6 @@ async def run_session(phone, country):
                 for c in clean_phone:
                     await page.keyboard.type(c); await asyncio.sleep(0.05)
                 
-                # Close keyboard
                 await page.touchscreen.tap(350, 100) 
                 
                 # GET CODE
@@ -329,54 +353,58 @@ async def run_session(phone, country):
                     # Error Popup
                     if await page.get_by_text("An unexpected problem", exact=False).count() > 0:
                         log_msg("⛔ FATAL: System Error (IP Block/Rate Limit)", "FATAL")
-                        await browser.close(); return "failed"
+                        img_bytes = await page.screenshot(type='jpeg', quality=50)
+                        await browser.close(); return "failed", base64.b64encode(img_bytes).decode('utf-8')
 
                     # Captcha Logic
                     start_solve_time = time.time()
                     while True: 
                         if time.time() - start_solve_time > 120: 
                             log_msg("⏰ Captcha Loop Timeout", "TIMEOUT")
-                            break
+                            img_bytes = await page.screenshot(type='jpeg', quality=50)
+                            return "failed", base64.b64encode(img_bytes).decode('utf-8')
 
                         if await page.get_by_text("swap 2 tiles", exact=False).count() > 0:
                             log_msg("🧩 CAPTCHA DETECTED!", "CAPTCHA")
                             
                             session_id = f"sess_{int(time.time())}"
-                            
                             log_msg("🧠 Calling Solver...", "AI")
                             ai_success = await solve_captcha(page, session_id, logger=lambda m: log_msg(m, "SOLVER"))
                             
                             if not ai_success:
                                 log_msg("⚠️ Solver Returned False", "AI")
-                                await browser.close(); return "failed" 
+                                img_bytes = await page.screenshot(type='jpeg', quality=50)
+                                await browser.close(); return "failed", base64.b64encode(img_bytes).decode('utf-8')
                             
                             log_msg("⏳ Verifying Solution (5s)...", "WAIT")
                             await asyncio.sleep(5)
                             
                             if await page.get_by_text("swap 2 tiles", exact=False).count() == 0:
                                 log_msg("✅ CAPTCHA SOLVED!", "SUCCESS")
-                                await browser.close(); return "success"
+                                await browser.close(); return "success", None
                             else:
                                 log_msg("🔁 Captcha still visible. Retrying...", "RETRY")
                                 continue
                         
                         if await page.get_by_text("sent", exact=False).count() > 0:
                             log_msg("✅ CODE SENT (Direct Success)!", "SUCCESS")
-                            await browser.close(); return "success"
+                            await browser.close(); return "success", None
                         
                         log_msg("❌ No Captcha & No Success Message Found.", "ERROR")
-                        await browser.close(); return "failed"
+                        img_bytes = await page.screenshot(type='jpeg', quality=50)
+                        await browser.close(); return "failed", base64.b64encode(img_bytes).decode('utf-8')
 
                 else:
                     log_msg("❌ Get Code Button Missing", "ERROR")
-                    return "failed"
+                    img_bytes = await page.screenshot(type='jpeg', quality=50)
+                    return "failed", base64.b64encode(img_bytes).decode('utf-8')
 
-            await browser.close(); return "failed"
+            await browser.close(); return "failed", None
 
     except Exception as e:
         log_msg(f"❌ Session Exception: {str(e)}", "ERROR")
-        return "failed"
-    except: return "failed"
+        return "failed", None
+    except: return "failed", None
 
 # --- LIFECYCLE ---
 @app.on_event("startup")
@@ -385,4 +413,4 @@ async def startup_event():
     asyncio.create_task(master_loop())
 
 @app.get("/")
-def read_root(): return {"status": "Running", "mode": "MongoDB Auto-Pilot (API Redeploy)"}
+def read_root(): return {"status": "Running", "mode": "MongoDB Auto-Pilot (Error Capture)"}
