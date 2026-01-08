@@ -14,3 +14,4 @@ pyautogui
 pymongo
 python-multipart
 motor
+requests
