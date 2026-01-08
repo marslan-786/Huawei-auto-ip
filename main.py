@@ -1,17 +1,18 @@
 import os
 import asyncio
-import random
 import time
+import requests
 import sys
 from datetime import datetime
 from fastapi import FastAPI
 from playwright.async_api import async_playwright
 from motor.motor_asyncio import AsyncIOMotorClient
 
-# --- 🔥 ENV CONFIGURATION 🔥 ---
-RAILWAY_TOKEN = os.environ.get("RAILWAY_TOKEN")
-RAILWAY_PROJECT_ID = os.environ.get("RAILWAY_PROJECT_ID")
-RAILWAY_SERVICE_ID = os.environ.get("RAILWAY_SERVICE_ID") 
+# --- 🔥 ENV CONFIGURATION (HARDCODED FOR STABILITY) 🔥 ---
+# آپ نے جو ٹوکن اور آئی ڈیز دی ہیں، وہ یہاں سیٹ کر دی ہیں
+RAILWAY_TOKEN = "7a4ef37f-1830-4c06-a802-d1dff8922ee2"
+RAILWAY_SERVICE_ID = "f3ebcb8d-70db-41a8-81dc-d7c14e550cbe" 
+RAILWAY_ENV_ID = "f323efa2-e1bd-4c3e-9790-080ef9481b92"
 
 # MongoDB Config
 MONGO_URI = "mongodb://mongo:AEvrikOWlrmJCQrDTQgfGtqLlwhwLuAA@crossover.proxy.rlwy.net:29609"
@@ -20,10 +21,12 @@ COL_PENDING = "phone_numbers"
 COL_SUCCESS = "success_numbers"
 COL_FAILED = "failed_numbers"
 
+# Global URL
+BASE_URL = "https://id5.cloud.huawei.com"
+
 # --- APP SETUP ---
 app = FastAPI()
 
-# Solver needs this folder usually, keeping it just for safety
 CAPTURE_DIR = "./captures"
 if not os.path.exists(CAPTURE_DIR): os.makedirs(CAPTURE_DIR)
 
@@ -39,7 +42,6 @@ SETTINGS = {"country": "Russia"}
 # --- LOGGING HELPER ---
 def log_msg(message, level="INFO"):
     timestamp = datetime.now().strftime("%H:%M:%S")
-    # flush=True is crucial for Railway Logs
     print(f"[{timestamp}] [{level}] {message}", flush=True)
 
 # --- DATABASE HELPERS ---
@@ -73,19 +75,46 @@ async def move_number_to_collection(phone, status):
     except Exception as e:
         log_msg(f"DB Move Error: {e}", "ERROR")
 
-# --- RAILWAY REDEPLOY ---
+# --- RAILWAY REDEPLOY (ACTUAL API CALL) ---
 def trigger_redeploy():
-    log_msg("🔄 Triggering Railway Redeploy...", "SYSTEM")
+    log_msg("🔄 Sending Redeploy Signal to Railway API...", "SYSTEM")
     
-    if not RAILWAY_TOKEN:
-        log_msg("⚠️ Railway Token missing. Exiting process to force restart.", "WARN")
-        os._exit(0)
+    url = "https://backboard.railway.app/graphql/v2"
+    headers = {
+        "Authorization": f"Bearer {RAILWAY_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    
+    # Correct GraphQL Mutation
+    query = """
+    mutation serviceInstanceRedeploy($serviceId: String!, $environmentId: String!) {
+        serviceInstanceRedeploy(serviceId: $serviceId, environmentId: $environmentId)
+    }
+    """
+    
+    variables = {
+        "serviceId": RAILWAY_SERVICE_ID,
+        "environmentId": RAILWAY_ENV_ID
+    }
+    
+    try:
+        response = requests.post(url, json={"query": query, "variables": variables}, headers=headers)
+        log_msg(f"API Response: {response.text}", "DEBUG")
+        
+        if response.status_code == 200 and "errors" not in response.json():
+            log_msg("✅ Redeploy Triggered Successfully! Shutting down...", "SYSTEM")
+            time.sleep(2) # Give logs time to flush
+            os._exit(0)
+        else:
+            log_msg(f"❌ API Redeploy Failed: {response.text}", "ERROR")
+            # Fallback: Just crash, maybe auto-restart helps
+            os._exit(1)
+            
+    except Exception as e:
+        log_msg(f"❌ Redeploy Request Error: {e}", "FATAL")
+        os._exit(1)
 
-    # Forcing exit causes Railway to restart the container (getting new IP usually)
-    log_msg("💀 Exiting process to force container restart (IP Rotation)...", "SYSTEM")
-    os._exit(0)
-
-# --- CLICK LOGIC (Pure Action) ---
+# --- CLICK LOGIC ---
 async def click_element(page, finder, name):
     try:
         el = finder()
@@ -98,8 +127,6 @@ async def click_element(page, finder, name):
                 cx = box['x'] + box['width'] / 2
                 cy = box['y'] + box['height'] / 2
                 log_msg(f"🖱️ Tapping {name}...", "ACTION")
-                
-                # No red dot, just click
                 await page.touchscreen.tap(cx, cy)
                 return True
         else:
@@ -146,7 +173,7 @@ async def smart_action(page, finder, verifier, step_name, wait_after=5):
 
 # --- MAIN WORKER ---
 async def master_loop():
-    log_msg("🟢 Auto-Bot Started (Fast Mode - No Captures)", "INIT")
+    log_msg("🟢 Auto-Bot Started (v3.0 API Redeploy Mode)", "INIT")
     
     # 1. Fetch Number
     db_doc = await get_next_number_from_db()
@@ -161,6 +188,7 @@ async def master_loop():
 
     # 2. Run Session
     try:
+        # Pass BASE_URL explicitly if needed, but it's global now
         res = await run_session(current_number, SETTINGS["country"])
         
         # 3. Move Number
@@ -175,8 +203,8 @@ async def master_loop():
         log_msg(f"🔥 CRITICAL CRASH: {e}", "FATAL")
         await move_number_to_collection(current_number, "failed")
 
-    # 4. RESTART
-    log_msg("🔄 Job Done. Triggering Redeploy...", "SYSTEM")
+    # 4. RESTART VIA API
+    log_msg("🔄 Job Done. Calling Railway API...", "SYSTEM")
     await asyncio.sleep(2)
     trigger_redeploy()
 
@@ -287,7 +315,7 @@ async def run_session(phone, country):
                 for c in clean_phone:
                     await page.keyboard.type(c); await asyncio.sleep(0.05)
                 
-                # Close keyboard by tapping empty space
+                # Close keyboard
                 await page.touchscreen.tap(350, 100) 
                 
                 # GET CODE
@@ -316,7 +344,6 @@ async def run_session(phone, country):
                             session_id = f"sess_{int(time.time())}"
                             
                             log_msg("🧠 Calling Solver...", "AI")
-                            # Solver might make its own screenshot, that's fine
                             ai_success = await solve_captcha(page, session_id, logger=lambda m: log_msg(m, "SOLVER"))
                             
                             if not ai_success:
@@ -358,4 +385,4 @@ async def startup_event():
     asyncio.create_task(master_loop())
 
 @app.get("/")
-def read_root(): return {"status": "Running", "mode": "Console-Only Auto-Pilot"}
+def read_root(): return {"status": "Running", "mode": "MongoDB Auto-Pilot (API Redeploy)"}
